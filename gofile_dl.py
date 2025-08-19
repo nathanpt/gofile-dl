@@ -212,11 +212,38 @@ class GofileDownloader:
         try:
             logger.info(f"Downloading {filename} to {self.output_dir}")
             
-            # Set stream=True to download in chunks and verify=True for SSL verification
-            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            # Set comprehensive headers to mimic a browser request
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': '*/*',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Referer': 'https://gofile.io/',
+                'Sec-Fetch-Dest': 'document',
+                'Sec-Fetch-Mode': 'navigate',
+                'Sec-Fetch-Site': 'same-origin',
+                'Pragma': 'no-cache',
+                'Cache-Control': 'no-cache'
+            }
+            
+            # First make a HEAD request to get the content length
+            try:
+                head_response = requests.head(download_url, headers=headers, timeout=10)
+                head_response.raise_for_status()
+                total_size = int(head_response.headers.get('content-length', 0))
+                logger.debug(f"HEAD request content-length: {total_size}")
+            except (requests.exceptions.RequestException, ValueError) as e:
+                logger.warning(f"Failed to get content length with HEAD request: {e}")
+                total_size = 0
+            
+            # Now make the actual GET request to download the file
             with requests.get(download_url, stream=True, headers=headers, verify=True, timeout=30) as r:
                 r.raise_for_status()
-                total_size = int(r.headers.get('content-length', 0))
+                
+                # If we didn't get content length from HEAD, try from GET
+                if total_size == 0:
+                    total_size = int(r.headers.get('content-length', 0))
+                    logger.debug(f"GET request content-length: {total_size}")
                 
                 # Verify we got a content-length header
                 if total_size == 0:
@@ -240,6 +267,8 @@ class GofileDownloader:
             
             # Verify file size after download
             actual_size = os.path.getsize(output_path)
+            logger.info(f"Downloaded file size: {actual_size} bytes")
+            
             if total_size > 0 and actual_size < total_size:
                 logger.error(f"Downloaded file size ({actual_size} bytes) is smaller than expected ({total_size} bytes). File may be corrupt.")
                 return False
