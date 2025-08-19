@@ -212,23 +212,39 @@ class GofileDownloader:
         try:
             logger.info(f"Downloading {filename} to {self.output_dir}")
             
-            with requests.get(download_url, stream=True) as r:
+            # Set stream=True to download in chunks and verify=True for SSL verification
+            headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
+            with requests.get(download_url, stream=True, headers=headers, verify=True, timeout=30) as r:
                 r.raise_for_status()
                 total_size = int(r.headers.get('content-length', 0))
                 
+                # Verify we got a content-length header
+                if total_size == 0:
+                    logger.warning(f"Content-Length header missing or zero for {filename}. Download may be incomplete.")
+                
+                # Open file in binary write mode
                 with open(output_path, 'wb') as f, tqdm(
                     desc=filename,
                     total=total_size,
                     unit='B',
                     unit_scale=True,
                     unit_divisor=1024,
+                    disable=total_size == 0,  # Disable progress bar if size unknown
                 ) as progress_bar:
+                    downloaded_size = 0
                     for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:
+                        if chunk:  # Filter out keep-alive chunks
                             f.write(chunk)
+                            downloaded_size += len(chunk)
                             progress_bar.update(len(chunk))
             
-            logger.info(f"Successfully downloaded {filename}")
+            # Verify file size after download
+            actual_size = os.path.getsize(output_path)
+            if total_size > 0 and actual_size < total_size:
+                logger.error(f"Downloaded file size ({actual_size} bytes) is smaller than expected ({total_size} bytes). File may be corrupt.")
+                return False
+                
+            logger.info(f"Successfully downloaded {filename} ({actual_size} bytes)")
             return True
         except requests.exceptions.RequestException as e:
             logger.error(f"Download failed: {e}")
@@ -238,6 +254,8 @@ class GofileDownloader:
             return False
         except IOError as e:
             logger.error(f"Failed to write file: {e}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
             return False
             
     def _download_folder_contents(self, children, custom_folder_name=None):
