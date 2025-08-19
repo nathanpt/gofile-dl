@@ -154,7 +154,14 @@ class GofileDownloader:
                 logger.error("No download link available")
                 return False
                 
-            # Determine filename
+            # Ensure we're using the direct download URL
+            # Sometimes Gofile returns a URL that needs to be modified for direct download
+            if 'gofile.io' in download_url and '/download/' not in download_url:
+                # Convert from /d/ format to /download/ format if needed
+                download_url = download_url.replace('/d/', '/download/')
+                logger.debug(f"Modified download URL: {download_url}")
+                
+            # Use custom filename if provided, otherwise use the original filename
             if custom_filename:
                 filename = custom_filename
             else:
@@ -192,6 +199,12 @@ class GofileDownloader:
                     logger.error("No download link available")
                     return False
                     
+                # Ensure we're using the direct download URL
+                if 'gofile.io' in download_url and '/download/' not in download_url:
+                    # Convert from /d/ format to /download/ format if needed
+                    download_url = download_url.replace('/d/', '/download/')
+                    logger.debug(f"Modified download URL: {download_url}")
+                    
                 # Determine filename
                 if custom_filename:
                     filename = custom_filename
@@ -208,73 +221,191 @@ class GofileDownloader:
         """Download a single file from the given URL"""
         output_path = os.path.join(self.output_dir, filename)
         
-        # Download the file with progress bar
-        try:
-            logger.info(f"Downloading {filename} to {self.output_dir}")
-            
-            # Set comprehensive headers to mimic a browser request
-            headers = {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': '*/*',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Referer': 'https://gofile.io/',
-                'Sec-Fetch-Dest': 'document',
-                'Sec-Fetch-Mode': 'navigate',
-                'Sec-Fetch-Site': 'same-origin',
-                'Pragma': 'no-cache',
-                'Cache-Control': 'no-cache'
-            }
-            
-            # First make a HEAD request to get the content length
+        # Try different approaches to download the file
+        approaches = [
+            self._download_with_requests,
+            self._download_with_urllib,
+            self._download_with_requests_session
+        ]
+        
+        for i, download_approach in enumerate(approaches):
             try:
-                head_response = requests.head(download_url, headers=headers, timeout=10)
-                head_response.raise_for_status()
-                total_size = int(head_response.headers.get('content-length', 0))
-                logger.debug(f"HEAD request content-length: {total_size}")
-            except (requests.exceptions.RequestException, ValueError) as e:
-                logger.warning(f"Failed to get content length with HEAD request: {e}")
-                total_size = 0
+                logger.info(f"Downloading {filename} to {self.output_dir} (attempt {i+1})")
+                success = download_approach(download_url, output_path, filename)
+                if success:
+                    return True
+                logger.warning(f"Download attempt {i+1} failed, trying next approach...")
+            except Exception as e:
+                logger.error(f"Error in download attempt {i+1}: {e}")
+                # Continue to next approach
+        
+        logger.error(f"All download attempts failed for {filename}")
+        return False
+        
+    def _download_with_requests(self, download_url, output_path, filename):
+        """Download a file using the requests library"""
+        # Set comprehensive headers to mimic a browser request
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Referer': 'https://gofile.io/',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'same-origin',
+            'Pragma': 'no-cache',
+            'Cache-Control': 'no-cache'
+        }
+        
+        # First make a HEAD request to get the content length
+        try:
+            head_response = requests.head(download_url, headers=headers, timeout=10)
+            head_response.raise_for_status()
+            total_size = int(head_response.headers.get('content-length', 0))
+            logger.debug(f"HEAD request content-length: {total_size}")
+        except (requests.exceptions.RequestException, ValueError) as e:
+            logger.warning(f"Failed to get content length with HEAD request: {e}")
+            total_size = 0
+        
+        # Now make the actual GET request to download the file
+        with requests.get(download_url, stream=True, headers=headers, verify=True, timeout=30) as r:
+            r.raise_for_status()
             
-            # Now make the actual GET request to download the file
-            with requests.get(download_url, stream=True, headers=headers, verify=True, timeout=30) as r:
-                r.raise_for_status()
+            # If we didn't get content length from HEAD, try from GET
+            if total_size == 0:
+                total_size = int(r.headers.get('content-length', 0))
+                logger.debug(f"GET request content-length: {total_size}")
+            
+            # Verify we got a content-length header
+            if total_size == 0:
+                logger.warning(f"Content-Length header missing or zero for {filename}. Download may be incomplete.")
+            
+            # Open file in binary write mode
+            with open(output_path, 'wb') as f, tqdm(
+                desc=filename,
+                total=total_size,
+                unit='B',
+                unit_scale=True,
+                unit_divisor=1024,
+                disable=total_size == 0,  # Disable progress bar if size unknown
+            ) as progress_bar:
+                downloaded_size = 0
+                for chunk in r.iter_content(chunk_size=8192):
+                    if chunk:  # Filter out keep-alive chunks
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        progress_bar.update(len(chunk))
+        
+        # Verify file size after download
+        actual_size = os.path.getsize(output_path)
+        logger.info(f"Downloaded file size: {actual_size} bytes")
+        
+        if total_size > 0 and actual_size < total_size:
+            logger.error(f"Downloaded file size ({actual_size} bytes) is smaller than expected ({total_size} bytes). File may be corrupt.")
+            return False
+            
+        logger.info(f"Successfully downloaded {filename} ({actual_size} bytes)")
+        return True
+        
+    def _download_with_urllib(self, download_url, output_path, filename):
+        """Download a file using urllib"""
+        import urllib.request
+        
+        logger.info(f"Trying urllib download approach for {filename}")
+        
+        # Create a Request object with headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': '*/*',
+            'Referer': 'https://gofile.io/'
+        }
+        
+        req = urllib.request.Request(download_url, headers=headers)
+        
+        try:
+            with urllib.request.urlopen(req, timeout=30) as response, open(output_path, 'wb') as out_file:
+                # Get content length if available
+                content_length = response.getheader('Content-Length')
+                total_size = int(content_length) if content_length else 0
                 
-                # If we didn't get content length from HEAD, try from GET
                 if total_size == 0:
-                    total_size = int(r.headers.get('content-length', 0))
-                    logger.debug(f"GET request content-length: {total_size}")
+                    logger.warning(f"Content-Length header missing in urllib approach")
                 
-                # Verify we got a content-length header
-                if total_size == 0:
-                    logger.warning(f"Content-Length header missing or zero for {filename}. Download may be incomplete.")
-                
-                # Open file in binary write mode
-                with open(output_path, 'wb') as f, tqdm(
+                # Setup progress bar
+                with tqdm(
                     desc=filename,
                     total=total_size,
                     unit='B',
                     unit_scale=True,
                     unit_divisor=1024,
-                    disable=total_size == 0,  # Disable progress bar if size unknown
+                    disable=total_size == 0,
                 ) as progress_bar:
                     downloaded_size = 0
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if chunk:  # Filter out keep-alive chunks
-                            f.write(chunk)
-                            downloaded_size += len(chunk)
-                            progress_bar.update(len(chunk))
+                    while True:
+                        buffer = response.read(8192)
+                        if not buffer:
+                            break
+                        out_file.write(buffer)
+                        downloaded_size += len(buffer)
+                        progress_bar.update(len(buffer))
             
-            # Verify file size after download
             actual_size = os.path.getsize(output_path)
-            logger.info(f"Downloaded file size: {actual_size} bytes")
+            logger.info(f"Downloaded file size with urllib: {actual_size} bytes")
             
             if total_size > 0 and actual_size < total_size:
-                logger.error(f"Downloaded file size ({actual_size} bytes) is smaller than expected ({total_size} bytes). File may be corrupt.")
+                logger.error(f"Downloaded file size ({actual_size} bytes) is smaller than expected ({total_size} bytes)")
                 return False
                 
-            logger.info(f"Successfully downloaded {filename} ({actual_size} bytes)")
             return True
+        except Exception as e:
+            logger.error(f"urllib download failed: {e}")
+            return False
+            
+    def _download_with_requests_session(self, download_url, output_path, filename):
+        """Download a file using a requests session with different parameters"""
+        logger.info(f"Trying requests session download approach for {filename}")
+        
+        session = requests.Session()
+        
+        # Set different headers
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+            'Accept-Language': 'en-US,en;q=0.5',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1'
+        }
+        
+        try:
+            # Try to download with a session
+            response = session.get(download_url, headers=headers, stream=True, timeout=30, allow_redirects=True)
+            response.raise_for_status()
+            
+            total_size = int(response.headers.get('content-length', 0))
+            
+            with open(output_path, 'wb') as f, tqdm(
+                desc=filename,
+                total=total_size,
+                unit='B',
+                unit_scale=True,
+                unit_divisor=1024,
+                disable=total_size == 0,
+            ) as progress_bar:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+                        progress_bar.update(len(chunk))
+            
+            actual_size = os.path.getsize(output_path)
+            logger.info(f"Downloaded file size with session: {actual_size} bytes")
+            
+            if actual_size > 0:
+                return True
+            return False
+        except Exception as e:
+            logger.error(f"Session download failed: {e}")
+            return False
         except requests.exceptions.RequestException as e:
             logger.error(f"Download failed: {e}")
             # Clean up partial download if it exists
@@ -329,6 +460,12 @@ class GofileDownloader:
                 if not download_url or not filename:
                     logger.warning(f"Skipping file with missing information: {child_id}")
                     continue
+                    
+                # Ensure we're using the direct download URL
+                if 'gofile.io' in download_url and '/download/' not in download_url:
+                    # Convert from /d/ format to /download/ format if needed
+                    download_url = download_url.replace('/d/', '/download/')
+                    logger.debug(f"Modified download URL: {download_url}")
                 
                 if self._download_single_file(download_url, filename):
                     success_count += 1
